@@ -1,0 +1,86 @@
+MODEL REPORT - Credit Scoring
+=============================
+
+1. ALGORITHM
+------------
+Model: LightGBM (gradient boosted decision trees), binary classifier.
+
+Why this algorithm:
+- The dataset is tabular with 145 features, 16 of them categorical, and
+  heavy missing values (67 of 122 raw columns). LightGBM handles missing
+  values and categorical features natively: at each tree split it learns
+  the best direction for missing values instead of requiring imputation.
+- Gradient boosting is the reference approach for tabular credit data
+  and trains on 307k rows in minutes.
+- Tree ensembles pair well with interpretability tooling: native feature
+  importances and fast exact SHAP values via TreeExplainer.
+
+Training setup:
+- Data: application_train.csv + per-client aggregates of bureau.csv and
+  previous_application.csv (see results/feature_engineering/EDA.ipynb).
+- Split: 64% train / 16% validation / 20% held-out test, stratified on
+  the target. The held-out test set was carved out before any training
+  or tuning and is only used by predict.py for the final AUC.
+- Class imbalance (8.07% defaults): class_weight="balanced" so the
+  minority class is not ignored by the loss function.
+
+2. OVERFITTING PREVENTION AND STOPPING DECISION
+-----------------------------------------------
+- Early stopping: training monitors validation AUC each boosting round
+  and stops after 100 rounds without improvement. It triggered at round
+  398 (ceiling was 5000), keeping the best-validation model.
+- Regularization: min_child_samples=100 (no leaf built on fewer than
+  100 clients), subsample=0.8 and colsample_bytree=0.8 (each tree sees
+  a random 80% of rows and features), learning_rate=0.05.
+- Evidence: results/model/learning_curve.png shows train and validation
+  AUC per round. The validation curve rises, plateaus around the best
+  iteration (dashed line) and does not decline - the model was stopped
+  at the validation peak, before overfitting could degrade generalization.
+- The gap between train AUC (0.87) and validation AUC (0.77) is expected
+  for boosted trees; the flat validation curve, stable held-out test AUC
+  (0.77) and consistent Kaggle leaderboard score confirm the model
+  generalizes.
+
+3. WHY ACCURACY SHOULD NOT BE USED
+----------------------------------
+Only 8.07% of clients default. A trivial model predicting "no default"
+for everyone reaches 91.93% accuracy while identifying zero defaulters -
+useless for a bank. Accuracy depends on a decision threshold and is
+inflated by the majority class.
+
+AUC (area under the ROC curve) is used instead: it is the probability
+that a randomly chosen defaulter is ranked riskier than a randomly
+chosen good payer. It is threshold-independent and insensitive to class
+imbalance. Additionally, class_weight="balanced" shifts predicted
+probabilities upward, which would distort accuracy further but leaves
+AUC untouched since ranking is preserved.
+
+4. RESULTS
+----------
+Validation AUC:      0.768 (early stopping, round 398)
+Held-out test AUC:   0.77  (printed by predict.py)
+Kaggle leaderboard:  see README (independent confirmation on the
+                     official unlabelled test set)
+Requirement: >= 0.55, ideally >= 0.62. Cleared.
+
+5. LIMITS AND POSSIBLE IMPROVEMENTS
+-----------------------------------
+Limits:
+- Only 2 of the 6 auxiliary tables are used (bureau, previous_application);
+  installments_payments, POS_CASH_balance, credit_card_balance and
+  bureau_balance contain unexploited repayment-behaviour signal.
+- Aggregations are simple statistics (count/mean/max/sum); no time-aware
+  features (e.g. trends over the last 12 months).
+- Hyperparameters were chosen from standard values, not systematically
+  tuned.
+- class_weight="balanced" makes probabilities poorly calibrated: scores
+  rank clients correctly but overstate absolute default probability.
+
+Possible improvements:
+- Aggregate the remaining tables (installments_payments first: payment
+  delays and underpayments are strong signals).
+- Time-windowed aggregations and trend features.
+- Hyperparameter search (e.g. Optuna) with cross-validation.
+- Probability calibration (isotonic/Platt) if calibrated probabilities
+  are needed for business decisions.
+- Model ensembling/stacking.
